@@ -268,7 +268,7 @@ def register_begin():
         user_display_name="Jefe (aprobador)",
         authenticator_selection=AuthenticatorSelectionCriteria(
             authenticator_attachment=AuthenticatorAttachment.PLATFORM,
-            resident_key=ResidentKeyRequirement.PREFERRED,
+            resident_key=ResidentKeyRequirement.DISCOURAGED,
             user_verification=UserVerificationRequirement.REQUIRED,
         ),
     )
