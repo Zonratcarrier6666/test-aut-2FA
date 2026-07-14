@@ -98,6 +98,7 @@ def home():
     <label>Detalle de la solicitud:</label>
     <input id="detalle" value="Aprobar compra de material - $50,000">
     <button onclick="crearSolicitud()">Crear solicitud y generar QR</button>
+    <p style="text-align:center;margin-top:20px"><a href="/historial">📋 Ver historial de solicitudes</a></p>
 
     <div id="qr"></div>
     <div id="status"></div>
@@ -152,8 +153,23 @@ def crear_solicitud(s: NuevaSolicitud):
         "solicitante": s.solicitante,
         "detalle": s.detalle,
         "created_at": time.time(),
+        "resolved_at": None,
+        "approver": None,
     }
     return {"request_id": request_id}
+
+
+@app.post("/api/request/{request_id}/reject")
+def rechazar_solicitud(request_id: str):
+    r = requests_db.get(request_id)
+    if not r:
+        raise HTTPException(404, "No existe")
+    if r["status"] != "pending":
+        raise HTTPException(400, "Esta solicitud ya fue resuelta")
+    r["status"] = "rejected"
+    r["resolved_at"] = time.time()
+    r["approver"] = JEFE_ID
+    return {"ok": True}
 
 
 @app.get("/api/request/{request_id}/status")
@@ -308,21 +324,55 @@ async def register_complete(request: Request):
 def approve_page(request_id: str):
     if request_id not in requests_db:
         return HTMLResponse("<h3>Solicitud no encontrada o expirada</h3>", status_code=404)
-    detalle = requests_db[request_id]["detalle"]
+    r = requests_db[request_id]
+    detalle = r["detalle"]
+
+    if r["status"] != "pending":
+        estado_txt = {"approved": "✅ Ya fue APROBADA", "rejected": "❌ Ya fue RECHAZADA"}.get(r["status"], r["status"])
+        return f"""
+        <html><head><title>Solicitud resuelta</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>body{{font-family:sans-serif;max-width:420px;margin:40px auto;padding:0 16px;text-align:center}}
+        .detalle{{background:#f0f0f0;padding:14px;border-radius:8px;margin-top:16px;text-align:left}}</style>
+        </head><body>
+        <h2>{estado_txt}</h2>
+        <div class="detalle"><b>Detalle:</b><br>{detalle}</div>
+        <p><a href="/historial">Ver historial completo</a></p>
+        </body></html>
+        """
+
     return f"""
     <html><head><title>Aprobar solicitud</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>body{{font-family:sans-serif;max-width:420px;margin:40px auto;padding:0 16px;text-align:center}}
     button{{padding:16px;font-size:18px;width:100%;margin-top:20px;background:#2e7d32;color:white;border:none;border-radius:8px}}
+    #rechazar{{background:#c62828}}
     .detalle{{background:#f0f0f0;padding:14px;border-radius:8px;margin-top:16px;text-align:left}}
     </style>
     </head><body>
     <h2>📱 Solicitud de autorizacion</h2>
     <div class="detalle"><b>Detalle:</b><br>{detalle}</div>
     <button onclick="aprobar()">🔐 Autorizar con huella / Face ID</button>
+    <button id="rechazar" onclick="rechazar()">✖ Rechazar</button>
     <p id="msg"></p>
 
     <script>
+    async function rechazar(){{
+        const msg = document.getElementById('msg');
+        if(!confirm('¿Seguro que quieres rechazar esta solicitud?')) return;
+        try{{
+            const resp = await fetch('/api/request/{request_id}/reject', {{method:'POST'}});
+            const result = await resp.json();
+            if(resp.ok){{
+                msg.innerText = '❌ Solicitud rechazada';
+                document.querySelectorAll('button').forEach(b => b.disabled = true);
+            }} else {{
+                msg.innerText = '⚠️ ' + (result.detail || 'Error al rechazar');
+            }}
+        }} catch(e){{
+            msg.innerText = '⚠️ ' + e.message;
+        }}
+    }}
     function b64uToBuf(b64u){{
         const pad = '='.repeat((4 - b64u.length % 4) % 4);
         const b64 = (b64u + pad).replace(/-/g,'+').replace(/_/g,'/');
@@ -385,6 +435,8 @@ def approve_page(request_id: str):
 def auth_begin(request_id: str):
     if request_id not in requests_db:
         raise HTTPException(404, "Solicitud no existe")
+    if requests_db[request_id]["status"] != "pending":
+        raise HTTPException(400, "Esta solicitud ya fue resuelta")
     if JEFE_ID not in credentials_db:
         raise HTTPException(400, "El jefe no ha registrado su biometria. Ve a /registrar-jefe primero")
 
@@ -426,8 +478,93 @@ async def auth_complete(request_id: str, request: Request):
     cred["sign_count"] = verification.new_sign_count
     requests_db[request_id]["status"] = "approved"
     requests_db[request_id]["approver"] = JEFE_ID
+    requests_db[request_id]["resolved_at"] = time.time()
     del pending_auth[request_id]
     return {"ok": True}
+
+
+@app.get("/api/request/all")
+def listar_solicitudes():
+    out = []
+    for rid, r in sorted(requests_db.items(), key=lambda kv: kv[1]["created_at"], reverse=True):
+        out.append({
+            "id": rid,
+            "status": r["status"],
+            "solicitante": r["solicitante"],
+            "detalle": r["detalle"],
+            "created_at": r["created_at"],
+            "resolved_at": r.get("resolved_at"),
+            "approver": r.get("approver"),
+        })
+    return out
+
+
+# ============================================================
+# PAGINA 4: HISTORIAL - todas las solicitudes, su estado y quien resolvio
+# ============================================================
+@app.get("/historial", response_class=HTMLResponse)
+def historial_page():
+    return """
+    <html><head><title>Historial de solicitudes</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body{font-family:sans-serif;max-width:900px;margin:24px auto;padding:0 16px}
+      table{width:100%;border-collapse:collapse;font-size:14px}
+      th,td{padding:10px 8px;text-align:left;border-bottom:1px solid #ddd}
+      th{background:#f5f5f5}
+      .pending{color:#b8860b;font-weight:bold}
+      .approved{color:#2e7d32;font-weight:bold}
+      .rejected{color:#c62828;font-weight:bold}
+      #empty{color:#888;padding:20px 0}
+      a{color:#1565c0}
+    </style>
+    </head><body>
+    <p><a href="/">← Volver a crear solicitud</a></p>
+    <h2>📋 Historial de solicitudes</h2>
+    <div id="empty" style="display:none">Aun no hay solicitudes.</div>
+    <table id="tabla" style="display:none">
+      <thead><tr>
+        <th>Detalle</th><th>Solicitante</th><th>Estado</th>
+        <th>Creada</th><th>Resuelta</th><th>Resuelta por</th>
+      </tr></thead>
+      <tbody id="filas"></tbody>
+    </table>
+
+    <script>
+    const estadoTxt = {pending:'⏳ Pendiente', approved:'✅ Aprobada', rejected:'❌ Rechazada'};
+
+    function fmt(ts){
+        if(!ts) return '—';
+        return new Date(ts*1000).toLocaleString();
+    }
+
+    async function cargar(){
+        const resp = await fetch('/api/request/all');
+        const data = await resp.json();
+        const tabla = document.getElementById('tabla');
+        const vacio = document.getElementById('empty');
+        const filas = document.getElementById('filas');
+        if(data.length === 0){
+            tabla.style.display='none'; vacio.style.display='block'; return;
+        }
+        vacio.style.display='none'; tabla.style.display='table';
+        filas.innerHTML = data.map(r => `
+            <tr>
+                <td>${r.detalle}</td>
+                <td>${r.solicitante}</td>
+                <td class="${r.status}">${estadoTxt[r.status] || r.status}</td>
+                <td>${fmt(r.created_at)}</td>
+                <td>${fmt(r.resolved_at)}</td>
+                <td>${r.approver || '—'}</td>
+            </tr>
+        `).join('');
+    }
+
+    cargar();
+    setInterval(cargar, 3000);
+    </script>
+    </body></html>
+    """
 
 
 if __name__ == "__main__":
