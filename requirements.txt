@@ -1,0 +1,4 @@
+fastapi==0.139.0
+uvicorn==0.51.0
+webauthn==3.0.0
+qrcode[pil]==8.2
