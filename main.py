@@ -18,6 +18,7 @@ import time
 import uuid
 
 import qrcode
+import pyotp
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
@@ -58,6 +59,19 @@ PORT = int(os.environ.get("PORT", 8000))
 credentials_db = {}        # user_id -> {credential_id, public_key, sign_count}
 pending_registration = {}  # user_id -> challenge
 pending_auth = {}          # request_id -> challenge
+
+# ------------------------------------------------------------
+# Fallback TOTP: para celulares viejos sin sensor biometrico.
+# NO reemplaza a la huella, solo entra cuando el celular no
+# tiene capacidad de autenticador biometrico (se detecta en el
+# navegador con isUserVerifyingPlatformAuthenticatorAvailable()).
+# ------------------------------------------------------------
+totp_db = {}              # user_id -> {secret}            (ya registrado, confirmado)
+pending_totp_secret = {}  # user_id -> secret               (generado, esperando confirmar)
+totp_attempts = {}        # request_id -> {"count": int, "locked_until": float}
+
+TOTP_MAX_ATTEMPTS = 5
+TOTP_LOCKOUT_SECONDS = 60
 
 JEFE_ID = "jefe-001"  # fijo para el test; en un sistema real vendria del login
 
@@ -214,6 +228,18 @@ tr:hover td{background:rgba(0,240,255,0.035)}
 @keyframes scanline{ 0%{top:0} 100%{top:100vh} }
 .btn-row{display:flex;gap:10px}
 .btn-row button{margin-top:14px}
+.totp-input{
+  font-family:'Orbitron',monospace;font-size:26px;letter-spacing:10px;text-align:center;
+  padding:16px 10px 16px 20px;
+}
+.fallback-note{
+  margin-top:16px;padding:12px 14px;border-radius:10px;font-size:12.5px;line-height:1.5;
+  background:rgba(255,179,0,0.08);color:var(--amber);border:1px solid rgba(255,179,0,0.35);
+}
+.method-toggle{
+  text-align:center;font-size:11.5px;color:var(--muted);letter-spacing:0.5px;margin-top:14px;
+}
+.method-toggle a{cursor:pointer}
 """
 
 
@@ -369,6 +395,11 @@ def registrar_jefe_page():
       <div id="msg"></div>
     </div>
 
+    <p style="text-align:center;font-size:0.85rem">
+      ¿El celular no tiene huella ni Face ID?
+      <a href="/registrar-jefe-totp">Registrar código de respaldo (TOTP) →</a>
+    </p>
+
     <script>
     {WEBAUTHN_HELPERS_JS}
     async function registrar(){{
@@ -467,6 +498,123 @@ async def register_complete(request: Request):
 
 
 # ============================================================
+# PAGINA 2b: CELULAR DEL JEFE - registro del codigo de respaldo TOTP
+# Solo para cuando el celular no tiene sensor biometrico.
+# ============================================================
+@app.get("/registrar-jefe-totp", response_class=HTMLResponse)
+def registrar_jefe_totp_page():
+    body = """
+    <div class="eyebrow"><span class="pulse-dot"></span>RESPALDO SIN BIOMETRIA</div>
+    <h2>Código de respaldo (TOTP)</h2>
+    <div class="subtitle">Úsalo solo si este celular <b>no tiene</b> huella ni Face ID.
+    Necesitas una app authenticator (Google Authenticator, Microsoft Authenticator, Authy, etc).
+    Se hace <b>una sola vez</b>.</div>
+
+    <div class="panel" style="text-align:center">
+      <span class="corner tl"></span><span class="corner tr"></span>
+      <span class="corner bl"></span><span class="corner br"></span>
+      <div id="paso1">
+        <button onclick="generar()">🔑 Generar código QR</button>
+      </div>
+      <div id="qrbox" style="display:none">
+        <div class="qr-frame">
+          <img id="qrimg" width="220">
+        </div>
+        <div style="margin-top:18px;text-align:left">
+          <label>Escanea el QR con tu app y escribe el código que te muestra</label>
+          <input id="codigo" class="totp-input" maxlength="6" inputmode="numeric" placeholder="000000">
+          <button onclick="confirmar()">✅ Confirmar y activar</button>
+        </div>
+      </div>
+      <div id="msg"></div>
+      <div class="fallback-note">
+        ⚠️ No compartas ni fotografíes esta pantalla mientras el QR esté visible:
+        cualquiera que lo escanee en este momento podría generar los mismos códigos.
+      </div>
+    </div>
+
+    <script>
+    async function generar(){
+        const msg = document.getElementById('msg');
+        try{
+            const resp = await fetch('/api/totp/begin', {method:'POST'});
+            const data = await resp.json();
+            if(!resp.ok) throw new Error(data.detail || 'Error generando el código');
+            document.getElementById('qrimg').src = '/totp/qr?ts=' + Date.now();
+            document.getElementById('paso1').style.display = 'none';
+            document.getElementById('qrbox').style.display = 'block';
+        }catch(e){
+            msg.className = 'rejected';
+            msg.innerText = '⚠️ ' + e.message;
+        }
+    }
+
+    async function confirmar(){
+        const msg = document.getElementById('msg');
+        const codigo = document.getElementById('codigo').value.trim();
+        try{
+            const resp = await fetch('/api/totp/register/complete', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({codigo})
+            });
+            const data = await resp.json();
+            if(data.ok){
+                msg.className = 'approved';
+                msg.innerText = '✅ RESPALDO ACTIVADO CORRECTAMENTE';
+                document.getElementById('qrbox').style.display = 'none';
+            } else {
+                msg.className = 'rejected';
+                msg.innerText = '❌ Código incorrecto, intenta de nuevo';
+            }
+        }catch(e){
+            msg.className = 'rejected';
+            msg.innerText = '⚠️ ' + e.message;
+        }
+    }
+    </script>
+    """
+    return page_shell("Código de respaldo (TOTP)", body)
+
+
+@app.post("/api/totp/begin")
+def totp_begin():
+    secret = pyotp.random_base32()
+    pending_totp_secret[JEFE_ID] = secret
+    return {"ok": True}
+
+
+@app.get("/totp/qr")
+def totp_qr():
+    secret = pending_totp_secret.get(JEFE_ID)
+    if not secret:
+        raise HTTPException(400, "No hay registro TOTP pendiente")
+    uri = pyotp.totp.TOTP(secret).provisioning_uri(
+        name="jefe@aprobaciones", issuer_name=RP_NAME
+    )
+    img = qrcode.make(uri)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png")
+
+
+@app.post("/api/totp/register/complete")
+async def totp_register_complete(request: Request):
+    body = await request.json()
+    codigo = (body.get("codigo") or "").strip()
+    secret = pending_totp_secret.get(JEFE_ID)
+    if not secret:
+        raise HTTPException(400, "No hay registro TOTP pendiente")
+
+    if not pyotp.totp.TOTP(secret).verify(codigo, valid_window=1):
+        return {"ok": False}
+
+    totp_db[JEFE_ID] = {"secret": secret}
+    del pending_totp_secret[JEFE_ID]
+    return {"ok": True}
+
+
+# ============================================================
 # PAGINA 3: CELULAR DEL JEFE - aprobar/rechazar una solicitud (via QR)
 # Tanto aprobar como rechazar exigen la misma verificacion biometrica.
 # ============================================================
@@ -509,18 +657,107 @@ def approve_page(request_id: str):
       <span class="corner tl"></span><span class="corner tr"></span>
       <span class="corner bl"></span><span class="corner br"></span>
       <div class="detalle-box"><b>Detalle</b>{detalle}</div>
-      <div class="btn-row">
-        <button onclick="resolver('approve')">🔓 Autorizar</button>
-        <button class="danger" onclick="resolver('reject')">✖ Rechazar</button>
+
+      <div id="huella-flow" style="display:none">
+        <div class="btn-row">
+          <button onclick="resolver('approve')">🔓 Autorizar</button>
+          <button class="danger" onclick="resolver('reject')">✖ Rechazar</button>
+        </div>
+        <div class="subtitle" style="margin:10px 0 0;text-align:center">
+          Ambas acciones piden huella / Face ID
+        </div>
+        <div class="method-toggle"><a onclick="forzarTotp()">¿Sin huella disponible? Usar código de respaldo →</a></div>
       </div>
-      <div class="subtitle" style="margin:10px 0 0;text-align:center">
-        Ambas acciones piden huella / Face ID
+
+      <div id="totp-flow" style="display:none">
+        <label>Código de tu app authenticator</label>
+        <input id="codigo" class="totp-input" maxlength="6" inputmode="numeric" placeholder="000000">
+        <div class="btn-row">
+          <button onclick="resolverTotp('approve')">🔓 Autorizar</button>
+          <button class="danger" onclick="resolverTotp('reject')">✖ Rechazar</button>
+        </div>
+        <div class="fallback-note">
+          Este método solo debe usarse si el celular no tiene sensor biométrico.
+          Requiere haber registrado antes el código en /registrar-jefe-totp.
+        </div>
       </div>
+
+      <div id="sin-metodo" class="fallback-note" style="display:none">
+        Este celular no tiene huella/Face ID y tampoco hay un código de respaldo
+        registrado. Ve a <a href="/registrar-jefe-totp">/registrar-jefe-totp</a> desde
+        el celular del jefe para activarlo.
+      </div>
+
       <div id="msg"></div>
     </div>
 
     <script>
     {WEBAUTHN_HELPERS_JS}
+
+    async function detectarMetodo(){{
+        let tieneHuella = false;
+        try{{
+            tieneHuella = !!(window.PublicKeyCredential &&
+                await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable());
+        }}catch(e){{ tieneHuella = false; }}
+
+        if(tieneHuella){{
+            document.getElementById('huella-flow').style.display = 'block';
+        }}else{{
+            mostrarTotp();
+        }}
+    }}
+
+    async function mostrarTotp(){{
+        document.getElementById('huella-flow').style.display = 'none';
+        const resp = await fetch('/api/totp/status');
+        const data = await resp.json();
+        if(data.registrado){{
+            document.getElementById('totp-flow').style.display = 'block';
+        }}else{{
+            document.getElementById('sin-metodo').style.display = 'block';
+        }}
+    }}
+
+    function forzarTotp(){{ mostrarTotp(); }}
+
+    detectarMetodo();
+
+    async function resolverTotp(accion){{
+        const msg = document.getElementById('msg');
+        const codigo = document.getElementById('codigo').value.trim();
+        if(codigo.length !== 6){{
+            msg.className = 'rejected';
+            msg.innerText = '⚠️ Escribe el código de 6 dígitos';
+            return;
+        }}
+        msg.className = '';
+        msg.innerText = '◌ Verificando código...';
+        try{{
+            const resp = await fetch('/api/auth/totp/{request_id}', {{
+                method:'POST', headers:{{'Content-Type':'application/json'}},
+                body: JSON.stringify({{action: accion, codigo}})
+            }});
+            const result = await resp.json();
+            if(result.ok){{
+                if(accion === 'approve'){{
+                    msg.className = 'approved';
+                    msg.innerText = '✅ AUTORIZADO CORRECTAMENTE';
+                }} else {{
+                    msg.className = 'rejected';
+                    msg.innerText = '❌ SOLICITUD RECHAZADA';
+                }}
+                document.querySelectorAll('button').forEach(b => b.disabled = true);
+            }} else {{
+                msg.className = 'rejected';
+                msg.innerText = '⚠️ ' + (result.error || 'Código incorrecto');
+            }}
+        }}catch(e){{
+            msg.className = 'rejected';
+            msg.innerText = '⚠️ ' + e.message;
+        }}
+    }}
+
     async function resolver(accion){{
         const msg = document.getElementById('msg');
         msg.className = '';
@@ -635,9 +872,59 @@ async def auth_complete(request_id: str, request: Request):
     cred["sign_count"] = verification.new_sign_count
     # La biometria fue valida -> se aplica la accion que el jefe eligio (aprobar o rechazar)
     requests_db[request_id]["status"] = "approved" if action == "approve" else "rejected"
-    requests_db[request_id]["approver"] = JEFE_ID
+    requests_db[request_id]["approver"] = f"{JEFE_ID} (huella)"
     requests_db[request_id]["resolved_at"] = time.time()
     del pending_auth[request_id]
+    return {"ok": True, "action": action}
+
+
+@app.get("/api/totp/status")
+def totp_status():
+    return {"registrado": JEFE_ID in totp_db}
+
+
+@app.post("/api/auth/totp/{request_id}")
+async def auth_totp_complete(request_id: str, request: Request):
+    """
+    Fallback para celulares sin sensor biometrico: misma logica que
+    auth_complete, pero verificando un codigo TOTP en vez de una firma
+    WebAuthn. Con limite de intentos para evitar fuerza bruta sobre
+    los 6 digitos.
+    """
+    body = await request.json()
+    action = body.get("action", "approve")
+    codigo = (body.get("codigo") or "").strip()
+    if action not in ("approve", "reject"):
+        raise HTTPException(400, "Accion invalida")
+
+    if request_id not in requests_db:
+        raise HTTPException(404, "Solicitud no existe")
+    if requests_db[request_id]["status"] != "pending":
+        raise HTTPException(400, "Esta solicitud ya fue resuelta")
+
+    if JEFE_ID not in totp_db:
+        raise HTTPException(400, "El jefe no ha registrado su código de respaldo TOTP")
+
+    now = time.time()
+    attempt = totp_attempts.setdefault(request_id, {"count": 0, "locked_until": 0})
+    if now < attempt["locked_until"]:
+        restante = int(attempt["locked_until"] - now)
+        return {"ok": False, "error": f"Demasiados intentos. Espera {restante}s antes de volver a intentar."}
+
+    secret = totp_db[JEFE_ID]["secret"]
+    if not pyotp.totp.TOTP(secret).verify(codigo, valid_window=1):
+        attempt["count"] += 1
+        if attempt["count"] >= TOTP_MAX_ATTEMPTS:
+            attempt["locked_until"] = now + TOTP_LOCKOUT_SECONDS
+            attempt["count"] = 0
+            return {"ok": False, "error": f"Demasiados intentos fallidos. Bloqueado {TOTP_LOCKOUT_SECONDS}s."}
+        return {"ok": False, "error": "Código incorrecto"}
+
+    attempt["count"] = 0
+    requests_db[request_id]["status"] = "approved" if action == "approve" else "rejected"
+    requests_db[request_id]["approver"] = f"{JEFE_ID} (TOTP)"
+    requests_db[request_id]["resolved_at"] = time.time()
+    del totp_attempts[request_id]
     return {"ok": True, "action": action}
 
 
