@@ -31,6 +31,7 @@ from webauthn import (
 )
 from webauthn.helpers.structs import (
     AuthenticatorSelectionCriteria,
+    AuthenticatorAttachment,
     UserVerificationRequirement,
     ResidentKeyRequirement,
     PublicKeyCredentialDescriptor,
@@ -213,6 +214,9 @@ def registrar_jefe_page():
         try{
             const beginResp = await fetch('/api/register/begin', {method:'POST'});
             const options = await beginResp.json();
+            if(!beginResp.ok){
+                throw new Error(options.detail || 'Error del servidor al iniciar registro');
+            }
 
             options.challenge = b64uToBuf(options.challenge);
             options.user.id = b64uToBuf(options.user.id);
@@ -263,6 +267,7 @@ def register_begin():
         user_name="jefe",
         user_display_name="Jefe (aprobador)",
         authenticator_selection=AuthenticatorSelectionCriteria(
+            authenticator_attachment=AuthenticatorAttachment.PLATFORM,
             resident_key=ResidentKeyRequirement.PREFERRED,
             user_verification=UserVerificationRequirement.REQUIRED,
         ),
@@ -338,6 +343,9 @@ def approve_page(request_id: str):
         try{{
             const beginResp = await fetch('/api/auth/begin/{request_id}', {{method:'POST'}});
             const options = await beginResp.json();
+            if(!beginResp.ok){{
+                throw new Error(options.detail || 'Error del servidor al iniciar autenticacion');
+            }}
             options.challenge = b64uToBuf(options.challenge);
             if(options.allowCredentials){{
                 options.allowCredentials = options.allowCredentials.map(c => ({{
