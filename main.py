@@ -13,6 +13,7 @@ No hay base de datos, no hay persistencia entre reinicios.
 
 import json
 import io
+import hashlib
 import os
 import time
 import uuid
@@ -77,6 +78,27 @@ JEFE_ID = "jefe-001"  # fijo para el test; en un sistema real vendria del login
 
 requests_db = {}
 # request_id -> {status, solicitante, detalle, created_at, resolved_at, approver}
+
+
+def sellar_resolucion(request_id: str, action: str, metodo: str, request: Request) -> None:
+    """
+    Deja evidencia de auditoria al resolver una solicitud: verifica que el
+    detalle no haya sido alterado desde que se creo (comparando contra el
+    hash congelado), y guarda IP + dispositivo + metodo usado. Esto es lo
+    que le da "peso de firma" a la autorizacion: no solo QUIEN aprobo,
+    sino CON QUE, DESDE DONDE, y que el contenido autorizado es el mismo
+    que se genero originalmente.
+    """
+    r = requests_db[request_id]
+    hash_actual = hashlib.sha256(f"{request_id}:{r['detalle']}".encode()).hexdigest()
+    integridad = "OK" if hash_actual == r.get("detalle_hash") else "ALERTA: el detalle no coincide con el original"
+
+    r["status"] = "approved" if action == "approve" else "rejected"
+    r["approver"] = f"{JEFE_ID} ({metodo})"
+    r["resolved_at"] = time.time()
+    r["approver_ip"] = request.client.host if request.client else "desconocida"
+    r["approver_device"] = request.headers.get("user-agent", "desconocido")
+    r["integridad"] = integridad
 
 
 class NuevaSolicitud(BaseModel):
@@ -346,13 +368,22 @@ def home():
 @app.post("/api/request/create")
 def crear_solicitud(s: NuevaSolicitud):
     request_id = str(uuid.uuid4())
+    # Ancla de integridad: hash del contenido exacto que se autoriza.
+    # Si el "detalle" cambiara despues (por bug, edicion manual del dict,
+    # etc.) antes de que el jefe resuelva, el hash ya no va a coincidir
+    # y se marca como alerta de integridad en el historial.
+    detalle_hash = hashlib.sha256(f"{request_id}:{s.detalle}".encode()).hexdigest()
     requests_db[request_id] = {
         "status": "pending",
         "solicitante": s.solicitante,
         "detalle": s.detalle,
+        "detalle_hash": detalle_hash,
         "created_at": time.time(),
         "resolved_at": None,
         "approver": None,
+        "approver_ip": None,
+        "approver_device": None,
+        "integridad": None,
     }
     return {"request_id": request_id}
 
@@ -871,9 +902,7 @@ async def auth_complete(request_id: str, request: Request):
 
     cred["sign_count"] = verification.new_sign_count
     # La biometria fue valida -> se aplica la accion que el jefe eligio (aprobar o rechazar)
-    requests_db[request_id]["status"] = "approved" if action == "approve" else "rejected"
-    requests_db[request_id]["approver"] = f"{JEFE_ID} (huella)"
-    requests_db[request_id]["resolved_at"] = time.time()
+    sellar_resolucion(request_id, action, "huella", request)
     del pending_auth[request_id]
     return {"ok": True, "action": action}
 
@@ -921,9 +950,7 @@ async def auth_totp_complete(request_id: str, request: Request):
         return {"ok": False, "error": "Código incorrecto"}
 
     attempt["count"] = 0
-    requests_db[request_id]["status"] = "approved" if action == "approve" else "rejected"
-    requests_db[request_id]["approver"] = f"{JEFE_ID} (TOTP)"
-    requests_db[request_id]["resolved_at"] = time.time()
+    sellar_resolucion(request_id, action, "TOTP", request)
     del totp_attempts[request_id]
     return {"ok": True, "action": action}
 
@@ -937,9 +964,13 @@ def listar_solicitudes():
             "status": r["status"],
             "solicitante": r["solicitante"],
             "detalle": r["detalle"],
+            "detalle_hash": r.get("detalle_hash"),
             "created_at": r["created_at"],
             "resolved_at": r.get("resolved_at"),
             "approver": r.get("approver"),
+            "approver_ip": r.get("approver_ip"),
+            "approver_device": r.get("approver_device"),
+            "integridad": r.get("integridad"),
         })
     return out
 
@@ -965,7 +996,7 @@ def historial_page():
       <table id="tabla" style="display:none">
         <thead><tr>
           <th>Detalle</th><th>Solicitante</th><th>Estado</th>
-          <th>Creada</th><th>Resuelta</th><th>Por</th>
+          <th>Creada</th><th>Resuelta</th><th>Por</th><th>Integridad</th>
         </tr></thead>
         <tbody id="filas"></tbody>
       </table>
@@ -979,6 +1010,11 @@ def historial_page():
         return new Date(ts*1000).toLocaleString();
     }
 
+    function toggleEvidencia(id){
+        const fila = document.getElementById('ev-' + id);
+        if(fila) fila.style.display = fila.style.display === 'none' ? 'table-row' : 'none';
+    }
+
     async function cargar(){
         const resp = await fetch('/api/request/all');
         const data = await resp.json();
@@ -989,16 +1025,32 @@ def historial_page():
             tabla.style.display='none'; vacio.style.display='block'; return;
         }
         vacio.style.display='none'; tabla.style.display='table';
-        filas.innerHTML = data.map(r => `
-            <tr>
-                <td>${r.detalle}</td>
+        filas.innerHTML = data.map(r => {
+            const integridadTxt = r.integridad
+                ? (r.integridad === 'OK' ? '🔒 OK' : '⚠️ ' + r.integridad)
+                : '—';
+            const integridadClass = r.integridad === 'OK' ? 'approved' : (r.integridad ? 'rejected' : '');
+            const tieneEvidencia = !!r.approver;
+            const filaPrincipal = `
+            <tr ${tieneEvidencia ? `style="cursor:pointer" onclick="toggleEvidencia('${r.id}')"` : ''}>
+                <td>${r.detalle}${tieneEvidencia ? ' <span style="color:var(--muted);font-size:11px">🔍 ver evidencia</span>' : ''}</td>
                 <td>${r.solicitante}</td>
                 <td class="${r.status}" style="font-weight:700">${estadoTxt[r.status] || r.status}</td>
                 <td>${fmt(r.created_at)}</td>
                 <td>${fmt(r.resolved_at)}</td>
                 <td>${r.approver || '—'}</td>
-            </tr>
-        `).join('');
+                <td class="${integridadClass}" style="font-weight:700">${integridadTxt}</td>
+            </tr>`;
+            const filaEvidencia = tieneEvidencia ? `
+            <tr id="ev-${r.id}" style="display:none;background:rgba(0,240,255,0.03)">
+                <td colspan="7" style="font-size:12px;color:var(--muted)">
+                    <b style="color:var(--cyan)">IP:</b> ${r.approver_ip || '—'} &nbsp;·&nbsp;
+                    <b style="color:var(--cyan)">Dispositivo:</b> ${(r.approver_device || '—').slice(0,90)} &nbsp;·&nbsp;
+                    <b style="color:var(--cyan)">Hash del detalle:</b> ${(r.detalle_hash || '—').slice(0,16)}...
+                </td>
+            </tr>` : '';
+            return filaPrincipal + filaEvidencia;
+        }).join('');
     }
 
     cargar();
