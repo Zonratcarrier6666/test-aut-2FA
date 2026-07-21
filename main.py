@@ -318,7 +318,10 @@ def home():
       <div id="status"></div>
     </div>
 
-    <p style="text-align:center"><a href="/historial">📋 Ver historial de solicitudes</a></p>
+    <p style="text-align:center">
+      <a href="/panel-jefe">🛎 Panel del jefe</a> &nbsp;·&nbsp;
+      <a href="/historial">📋 Historial</a>
+    </p>
 
     <script>
     let requestId = null;
@@ -986,7 +989,11 @@ def historial_page():
         <div class="eyebrow"><span class="pulse-dot"></span>REGISTRO DE AUDITORIA</div>
         <h2 style="margin-bottom:0">Historial de solicitudes</h2>
       </div>
-      <a class="back-link" href="/">← Nueva solicitud</a>
+      <div>
+        <a class="back-link" href="/panel-jefe">🛎 Panel del jefe</a>
+        &nbsp;·&nbsp;
+        <a class="back-link" href="/">← Nueva solicitud</a>
+      </div>
     </div>
 
     <div class="panel">
@@ -1058,6 +1065,209 @@ def historial_page():
     </script>
     """
     return page_shell("Historial de solicitudes", body, wide=True)
+
+
+# ============================================================
+# PAGINA 3b: PANEL DEL JEFE - todas las solicitudes pendientes
+# en un solo lugar (sin depender de escanear un QR por cada una),
+# con boton para autorizar/rechazar cada una (misma verificacion
+# biometrica/TOTP que /approve/{id}) y acceso directo al historial.
+# ============================================================
+@app.get("/panel-jefe", response_class=HTMLResponse)
+def panel_jefe_page():
+    body = f"""
+    <div class="top-nav">
+      <div>
+        <div class="eyebrow"><span class="pulse-dot"></span>BANDEJA DEL APROBADOR</div>
+        <h2 style="margin-bottom:0">Panel del jefe</h2>
+      </div>
+      <a class="back-link" href="/historial">📋 Ver historial completo</a>
+    </div>
+    <div class="subtitle">Solicitudes esperando tu autorizacion. Cada accion pide
+    huella/Face ID (o el codigo de respaldo si el celular no tiene sensor).</div>
+
+    <div id="lista"></div>
+    <div id="vacio" class="panel empty" style="display:none">
+      — NO HAY SOLICITUDES PENDIENTES —
+    </div>
+
+    <script>
+    {WEBAUTHN_HELPERS_JS}
+
+    let refrescando = false;
+
+    async function cargarPendientes(){{
+        if(refrescando) return;  // evita pisar un flujo de biometria en curso
+        const resp = await fetch('/api/request/all');
+        const data = await resp.json();
+        const pendientes = data.filter(r => r.status === 'pending');
+        const lista = document.getElementById('lista');
+        const vacio = document.getElementById('vacio');
+
+        if(pendientes.length === 0){{
+            lista.innerHTML = '';
+            vacio.style.display = 'block';
+            return;
+        }}
+        vacio.style.display = 'none';
+
+        lista.innerHTML = pendientes.map(r => `
+        <div class="panel" data-id="${{r.id}}">
+          <span class="corner tl"></span><span class="corner tr"></span>
+          <span class="corner bl"></span><span class="corner br"></span>
+          <div class="detalle-box" style="margin-top:0">
+            <b>Detalle</b>${{r.detalle}}
+            <div style="margin-top:8px;font-size:11.5px;color:var(--muted)">
+              Solicitante: ${{r.solicitante}} &nbsp;·&nbsp; ${{new Date(r.created_at*1000).toLocaleString()}}
+            </div>
+          </div>
+
+          <div id="huella-${{r.id}}" style="display:none">
+            <div class="btn-row">
+              <button onclick="resolver('${{r.id}}','approve')">🔓 Autorizar</button>
+              <button class="danger" onclick="resolver('${{r.id}}','reject')">✖ Rechazar</button>
+            </div>
+            <div class="method-toggle"><a onclick="mostrarTotp('${{r.id}}')">¿Sin huella disponible? Usar código de respaldo →</a></div>
+          </div>
+
+          <div id="totp-${{r.id}}" style="display:none">
+            <label>Código de tu app authenticator</label>
+            <input id="codigo-${{r.id}}" class="totp-input" maxlength="6" inputmode="numeric" placeholder="000000">
+            <div class="btn-row">
+              <button onclick="resolverTotp('${{r.id}}','approve')">🔓 Autorizar</button>
+              <button class="danger" onclick="resolverTotp('${{r.id}}','reject')">✖ Rechazar</button>
+            </div>
+          </div>
+
+          <div id="sinmetodo-${{r.id}}" class="fallback-note" style="display:none">
+            Este celular no tiene huella/Face ID y tampoco hay un código de respaldo
+            registrado. Ve a <a href="/registrar-jefe-totp">/registrar-jefe-totp</a> para activarlo.
+          </div>
+
+          <div id="msg-${{r.id}}"></div>
+        </div>
+        `).join('');
+
+        pendientes.forEach(r => detectarMetodo(r.id));
+    }}
+
+    async function detectarMetodo(id){{
+        let tieneHuella = false;
+        try{{
+            tieneHuella = !!(window.PublicKeyCredential &&
+                await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable());
+        }}catch(e){{ tieneHuella = false; }}
+
+        if(tieneHuella){{
+            document.getElementById('huella-' + id).style.display = 'block';
+        }}else{{
+            await mostrarTotp(id);
+        }}
+    }}
+
+    async function mostrarTotp(id){{
+        const huella = document.getElementById('huella-' + id);
+        if(huella) huella.style.display = 'none';
+        const resp = await fetch('/api/totp/status');
+        const data = await resp.json();
+        if(data.registrado){{
+            document.getElementById('totp-' + id).style.display = 'block';
+        }}else{{
+            document.getElementById('sinmetodo-' + id).style.display = 'block';
+        }}
+    }}
+
+    async function resolverTotp(id, accion){{
+        const msg = document.getElementById('msg-' + id);
+        const codigo = document.getElementById('codigo-' + id).value.trim();
+        if(codigo.length !== 6){{
+            msg.className = 'rejected';
+            msg.innerText = '⚠️ Escribe el código de 6 dígitos';
+            return;
+        }}
+        refrescando = true;
+        msg.className = '';
+        msg.innerText = '◌ Verificando código...';
+        try{{
+            const resp = await fetch(`/api/auth/totp/${{id}}`, {{
+                method:'POST', headers:{{'Content-Type':'application/json'}},
+                body: JSON.stringify({{action: accion, codigo}})
+            }});
+            const result = await resp.json();
+            if(result.ok){{
+                msg.className = accion === 'approve' ? 'approved' : 'rejected';
+                msg.innerText = accion === 'approve' ? '✅ AUTORIZADO CORRECTAMENTE' : '❌ SOLICITUD RECHAZADA';
+                setTimeout(cargarPendientes, 900);
+            }} else {{
+                msg.className = 'rejected';
+                msg.innerText = '⚠️ ' + (result.error || 'Código incorrecto');
+            }}
+        }}catch(e){{
+            msg.className = 'rejected';
+            msg.innerText = '⚠️ ' + e.message;
+        }}finally{{
+            refrescando = false;
+        }}
+    }}
+
+    async function resolver(id, accion){{
+        const msg = document.getElementById('msg-' + id);
+        refrescando = true;
+        msg.className = '';
+        msg.innerText = '◌ Esperando verificacion biometrica...';
+        try{{
+            const beginResp = await fetch(`/api/auth/begin/${{id}}`, {{method:'POST'}});
+            const options = await beginResp.json();
+            if(!beginResp.ok){{
+                throw new Error(options.detail || 'Error del servidor al iniciar verificacion');
+            }}
+            options.challenge = b64uToBuf(options.challenge);
+            if(options.allowCredentials){{
+                options.allowCredentials = options.allowCredentials.map(c => ({{
+                    ...c, id: b64uToBuf(c.id)
+                }}));
+            }}
+
+            const assertion = await navigator.credentials.get({{publicKey: options}});
+
+            const payload = {{
+                action: accion,
+                id: assertion.id,
+                rawId: bufToB64u(assertion.rawId),
+                type: assertion.type,
+                response: {{
+                    clientDataJSON: bufToB64u(assertion.response.clientDataJSON),
+                    authenticatorData: bufToB64u(assertion.response.authenticatorData),
+                    signature: bufToB64u(assertion.response.signature),
+                }}
+            }};
+
+            const completeResp = await fetch(`/api/auth/complete/${{id}}`, {{
+                method:'POST', headers:{{'Content-Type':'application/json'}},
+                body: JSON.stringify(payload)
+            }});
+            const result = await completeResp.json();
+            if(result.ok){{
+                msg.className = accion === 'approve' ? 'approved' : 'rejected';
+                msg.innerText = accion === 'approve' ? '✅ AUTORIZADO CORRECTAMENTE' : '❌ SOLICITUD RECHAZADA';
+                setTimeout(cargarPendientes, 900);
+            }} else {{
+                msg.className = 'rejected';
+                msg.innerText = '⚠️ ' + (result.error || 'Error de verificacion');
+            }}
+        }} catch(e){{
+            msg.className = 'rejected';
+            msg.innerText = '⚠️ ' + e.message;
+        }}finally{{
+            refrescando = false;
+        }}
+    }}
+
+    cargarPendientes();
+    setInterval(cargarPendientes, 3000);
+    </script>
+    """
+    return page_shell("Panel del jefe", body, wide=True)
 
 
 if __name__ == "__main__":
