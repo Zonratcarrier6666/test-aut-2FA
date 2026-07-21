@@ -319,6 +319,7 @@ def home():
     </div>
 
     <p style="text-align:center">
+      <a href="/registrar-jefe">🔐 Registrar jefe</a> &nbsp;·&nbsp;
       <a href="/panel-jefe">🛎 Panel del jefe</a> &nbsp;·&nbsp;
       <a href="/historial">📋 Historial</a>
     </p>
@@ -990,6 +991,8 @@ def historial_page():
         <h2 style="margin-bottom:0">Historial de solicitudes</h2>
       </div>
       <div>
+        <a class="back-link" href="/registrar-jefe">🔐 Registrar jefe</a>
+        &nbsp;·&nbsp;
         <a class="back-link" href="/panel-jefe">🛎 Panel del jefe</a>
         &nbsp;·&nbsp;
         <a class="back-link" href="/">← Nueva solicitud</a>
@@ -1081,7 +1084,11 @@ def panel_jefe_page():
         <div class="eyebrow"><span class="pulse-dot"></span>BANDEJA DEL APROBADOR</div>
         <h2 style="margin-bottom:0">Panel del jefe</h2>
       </div>
-      <a class="back-link" href="/historial">📋 Ver historial completo</a>
+      <div>
+        <a class="back-link" href="/registrar-jefe">🔐 Registrar jefe</a>
+        &nbsp;·&nbsp;
+        <a class="back-link" href="/historial">📋 Ver historial completo</a>
+      </div>
     </div>
     <div class="subtitle">Solicitudes esperando tu autorizacion. Cada accion pide
     huella/Face ID (o el codigo de respaldo si el celular no tiene sensor).</div>
